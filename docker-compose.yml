@@ -1,0 +1,146 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database/init-senqo-schema.sql:/docker-entrypoint-initdb.d/20-senqo-schema.sql:ro
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-bulk_email}
+      POSTGRES_USER: ${POSTGRES_USER:-bulk_email_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bulk_email_user} -d ${POSTGRES_DB:-bulk_email}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - backend
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy noeviction
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - backend
+
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: >
+      sh -c "npx node-pg-migrate up --migrations-dir 'dist/db/migrations/*.js' --use-glob &&
+      node dist/db/seeds/001_admin-user.js && node dist/index.js"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-bulk_email_user}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-bulk_email}
+      REDIS_URL: redis://redis:6379
+      PORT: 3001
+      UPLOAD_DIR: /app/uploads
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      TRACKING_DOMAIN: ${TRACKING_DOMAIN}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      AI_EMAIL_GENERATION_ENABLED: ${AI_EMAIL_GENERATION_ENABLED:-true}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
+      OPENAI_MAX_OUTPUT_TOKENS: ${OPENAI_MAX_OUTPUT_TOKENS:-4000}
+      OPENAI_TIMEOUT_MS: ${OPENAI_TIMEOUT_MS:-45000}
+      OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES:-2}
+      AI_RATE_LIMIT_REQUESTS: ${AI_RATE_LIMIT_REQUESTS:-10}
+      AI_RATE_LIMIT_WINDOW_MS: ${AI_RATE_LIMIT_WINDOW_MS:-60000}
+      SES_SNS_VERIFY_SIGNATURE: ${SES_SNS_VERIFY_SIGNATURE:-true}
+      SENQO_SSO_SHARED_SECRET: ${SENQO_SSO_SHARED_SECRET:-}
+    volumes:
+      - uploads:/app/uploads
+    networks:
+      - backend
+      - frontend
+
+  worker:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: node dist/workers/index.js
+    depends_on:
+      server:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-bulk_email_user}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-bulk_email}
+      REDIS_URL: redis://redis:6379
+      UPLOAD_DIR: /app/uploads
+      JWT_SECRET: ${JWT_SECRET}
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      TRACKING_DOMAIN: ${TRACKING_DOMAIN}
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      SES_CONFIGURATION_SET: ${SES_CONFIGURATION_SET:-}
+      SES_EVENT_QUEUE_URL: ${SES_EVENT_QUEUE_URL:-}
+      SENQO_SSO_SHARED_SECRET: ${SENQO_SSO_SHARED_SECRET:-}
+      SENQO_AUTOMATION_WEBHOOK_URL: ${SENQO_AUTOMATION_WEBHOOK_URL:-}
+      SENQO_AUTOMATION_WEBHOOK_SECRET: ${SENQO_AUTOMATION_WEBHOOK_SECRET:-}
+      SENQO_OUTBOX_MAX_ATTEMPTS: ${SENQO_OUTBOX_MAX_ATTEMPTS:-8}
+      SENQO_DATABASE_URL: ${SENQO_DATABASE_URL:-}
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'node dist/workers' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    volumes:
+      - uploads:/app/uploads
+    networks:
+      - backend
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks:
+      - frontend
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_HOST_PORT:-8080}:80"
+      - "${HTTPS_HOST_PORT:-8443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - server
+      - client
+    networks:
+      - frontend
+      - backend
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:
+
+networks:
+  backend:
+  frontend:

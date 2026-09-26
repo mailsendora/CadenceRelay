@@ -1,0 +1,535 @@
+import { ToolLoopAgent, Output, type ModelMessage, stepCountIs } from "ai";
+import type { RunAgentInput, RunAgentResult } from "../types/agent.js";
+import {
+  formatAgentPrepareStepBlock,
+  formatAgentStepFinishBlock,
+  formatAgentStructuredOutputBlock,
+  inferStepAction,
+  previewMessage,
+  summarizeApplyConversationLabelsCalls,
+  summarizeText,
+} from "../agent/logging.js";
+import {
+  asStorableAgentMessageContent,
+  extractGeneratedModelMessages,
+  pruneOrphanedToolCalls,
+  toModelMessageFromRow,
+} from "../agent/messages.js";
+import { resolveSessionId } from "../agent/session.js";
+import { buildAgentInstructionsWithCatalog } from "../agent/skills-catalog.js";
+import { getAgentTools } from "../agent/tools/index.js";
+import { normalizeStoredContentForModelMessage } from "../lib/agent-multimodal-normalize.js";
+import { BUILTIN_AGENT_TOOL_KEYS } from "../lib/builtin-agent-tool-keys.js";
+import { env } from "../lib/env.js";
+import type {
+  StoredUserImageUrlPart,
+  StoredUserTextPart,
+} from "../types/agent-multimodal.js";
+import {
+  insertAgentMessages,
+  listAgentMessages,
+} from "../repositories/agent-messages.js";
+import {
+  getAgentConfigById,
+  markAgentConfigFirstUsed,
+} from "../repositories/agent.js";
+import { touchAgentSession } from "../repositories/agent-sessions.js";
+import { mergeAiReasoningOntoAgentRunMessages } from "../repositories/whatsapp.js";
+import {
+  resolveAgentReplySources,
+  resolveHandoffTopicLabel,
+} from "./reply-sources.js";
+import { prepareOutboundMessages, sendPreparedOutboundMessages } from "../services/agent-outbound-messages.js";
+import {
+  AGENT_RUN_LOG_KIND_LLM_OUTPUT,
+  AGENT_RUN_LOG_KIND_WHATSAPP_SENT,
+  AGENT_RUN_LOG_SOURCE,
+  isAgentRunLogProviderOptions,
+} from "../lib/agent-run-log.js";
+import { agentOutputSchema } from "./agent-output-schema.js";
+import { getChatLLM } from "./llm.js";
+
+const logScope = "AgentRuntime";
+
+const DEFAULT_AGENT_TOOL_KEYS = BUILTIN_AGENT_TOOL_KEYS;
+
+function isMissingToolResultError(messageText: string): boolean {
+  return /Tool result(s)? (is|are) missing for tool call(s)?/i.test(
+    messageText,
+  );
+}
+
+export async function runAgentSession(
+  input: RunAgentInput,
+): Promise<RunAgentResult | null> {
+  const isDryRun = Boolean(input.dryRun);
+  const skipInference = Boolean(input.skipInference);
+  const sessionId = await resolveSessionId(
+    input.workspaceId,
+    isDryRun,
+    input.sessionId,
+  );
+  if (!sessionId) {
+    return null;
+  }
+
+  const agentRunId = !isDryRun ? crypto.randomUUID() : undefined;
+
+  let historyMessages: ModelMessage[] = [];
+  if (input.historyOverride) {
+    historyMessages = pruneOrphanedToolCalls(input.historyOverride);
+  } else if (!isDryRun) {
+    const historicalRows = (await listAgentMessages(
+      input.workspaceId,
+      sessionId,
+    )).filter((row) => !isAgentRunLogProviderOptions(row.provider_options));
+    const rawHistory = historicalRows.map((row) =>
+      toModelMessageFromRow({
+        role: row.role,
+        content: row.content,
+      }),
+    );
+    historyMessages = pruneOrphanedToolCalls(rawHistory);
+    if (historyMessages.length < rawHistory.length) {
+      console.warn(
+        `[${logScope}] Pruned ${rawHistory.length - historyMessages.length} orphaned tool-call message(s) from history sessionId=${sessionId}`,
+      );
+    } else {
+      const assistantShapes = rawHistory
+        .filter((m) => m.role === "assistant")
+        .map((m) => {
+          if (typeof m.content === "string") return "string";
+          if (!Array.isArray(m.content)) return typeof m.content;
+          return m.content
+            .map((p) => (p as { type?: string }).type ?? "unknown")
+            .join("+");
+        });
+      console.info(
+        `[${logScope}] History shape sessionId=${sessionId} rows=${rawHistory.length} assistantContent=[${assistantShapes.join(", ")}]`,
+      );
+    }
+  }
+
+  const inboundMessageContent = input.messageTimestamp
+    ? `Incoming message timestamp: ${input.messageTimestamp}\n\n${input.message}`
+    : input.message;
+  const mediaParts = input.userMediaParts ?? [];
+  const textPart: StoredUserTextPart = {
+    type: "text",
+    text: inboundMessageContent,
+  };
+  const userContentForDb: Array<StoredUserTextPart | StoredUserImageUrlPart> =
+    mediaParts.length > 0 ? [textPart, ...mediaParts] : [textPart];
+
+  const userMessageForModel = {
+    role: "user" as const,
+    content: normalizeStoredContentForModelMessage({
+      role: "user",
+      content: userContentForDb,
+    }),
+  } as ModelMessage;
+
+  if (!isDryRun) {
+    const userSaved = await insertAgentMessages([
+      {
+        workspaceId: input.workspaceId,
+        sessionId,
+        role: "user",
+        content: asStorableAgentMessageContent("user", userContentForDb),
+      },
+    ]);
+
+    if (!userSaved) {
+      return null;
+    }
+
+    if (input.agentConfigId && !skipInference) {
+      await markAgentConfigFirstUsed(input.workspaceId, input.agentConfigId);
+    }
+  }
+
+  if (skipInference) {
+    if (!isDryRun) {
+      await touchAgentSession(input.workspaceId, sessionId);
+      const reason =
+        input.skipInferenceReason?.trim() || "inference skipped by policy";
+      console.info(
+        `[${logScope}] Inbound saved to agent session but not processed: sessionId=${sessionId} reason=${reason}`,
+      );
+    }
+    return {
+      sessionId,
+      messages: [],
+      handoff_enabled: false,
+      handoffCalled: false,
+      handoffTopicEntryId: null,
+      handoffReason: null,
+      reasoningForOperators: "",
+    };
+  }
+
+  const { instructions, sourceCatalog } = await buildAgentInstructionsWithCatalog(
+    input.workspaceId,
+    input.agentConfigId,
+    isDryRun,
+    sessionId,
+  );
+  const config = input.agentConfigId
+    ? await getAgentConfigById(input.workspaceId, input.agentConfigId)
+    : null;
+  const enabledToolKeys = Array.from(
+    new Set([
+      ...DEFAULT_AGENT_TOOL_KEYS,
+      ...(Array.isArray(config?.tools) ? config.tools : []),
+    ]),
+  );
+  const tools = await getAgentTools(
+    {
+      workspaceId: input.workspaceId,
+      sessionId,
+      agentConfigId: input.agentConfigId,
+      dryRun: isDryRun,
+      ...(agentRunId ? { agentRunId } : {}),
+    },
+    enabledToolKeys,
+  );
+  const activeTools = Object.keys(tools);
+
+  console.info(
+    `[${logScope}/tools] active=${activeTools.length > 0 ? activeTools.join(",") : "none"}`,
+  );
+
+  const applyConversationLabelsCalls: Array<{ args: unknown; output: unknown }> =
+    [];
+  const handoffToHumanCalls: Array<{
+    topicEntryId: string | null;
+    reason: string | null;
+  }> = [];
+  const loadedSkillNames: string[] = [];
+
+  const agent = new ToolLoopAgent({
+    model: getChatLLM(),
+    instructions,
+    tools,
+    activeTools,
+    ...(env.modelProvider !== "groq" ? { output: Output.object({
+      schema: agentOutputSchema,
+      name: "agent_run_result",
+      description:
+        "Return the final agent run result. Put customer WhatsApp bubbles in messages (0–3). Set handoff_enabled when you called handoff_to_human. Include reasoning_for_operators and sources for workspace operators (never paste into messages).",
+    }) } : {}),
+    stopWhen: stepCountIs(20),
+    prepareStep: ({ stepNumber, messages }) => {
+      const lastMessage = messages[messages.length - 1] as
+        | ModelMessage
+        | undefined;
+      const action = inferStepAction(lastMessage);
+      console.info(
+        formatAgentPrepareStepBlock(logScope, {
+          stepNumber,
+          action,
+          totalMessages: messages.length,
+          lastPreview: previewMessage(lastMessage),
+        }),
+      );
+      return {};
+    },
+    onStepFinish: (event) => {
+      const textPreview = summarizeText(event.text);
+      const toolCalls = Array.isArray(event.toolCalls) ? event.toolCalls : [];
+      const toolResults = Array.isArray(event.toolResults)
+        ? event.toolResults
+        : [];
+      const toolNames =
+        toolCalls.length > 0
+          ? toolCalls.map((call) => call.toolName).join(", ")
+          : "(none)";
+      const stepAction =
+        toolCalls.length > 0
+          ? "calling tools"
+          : textPreview
+            ? "drafting response"
+            : "reasoning";
+
+      for (const call of toolCalls) {
+        if (call.toolName === "apply_conversation_labels") {
+          const matching = toolResults.find(
+            (result) => result.toolCallId === call.toolCallId,
+          );
+          applyConversationLabelsCalls.push({
+            args: call.input,
+            output: matching?.output,
+          });
+        }
+        if (call.toolName === "load_skills") {
+          const matching = toolResults.find(
+            (result) => result.toolCallId === call.toolCallId,
+          );
+          const output =
+            matching?.output && typeof matching.output === "object"
+              ? (matching.output as Record<string, unknown>)
+              : {};
+          const callRecord = call as unknown as {
+            input?: unknown;
+            args?: unknown;
+          };
+          const rawArgs =
+            callRecord.input && typeof callRecord.input === "object"
+              ? (callRecord.input as Record<string, unknown>)
+              : callRecord.args && typeof callRecord.args === "object"
+                ? (callRecord.args as Record<string, unknown>)
+                : {};
+          const nameRaw = output.skill_name ?? rawArgs.skill_name;
+          if (output.ok === true && typeof nameRaw === "string" && nameRaw.trim()) {
+            loadedSkillNames.push(nameRaw.trim());
+          }
+        }
+        if (call.toolName === "handoff_to_human") {
+          const callRecord = call as unknown as {
+            input?: unknown;
+            args?: unknown;
+          };
+          const rawArgs =
+            callRecord.input && typeof callRecord.input === "object"
+              ? (callRecord.input as Record<string, unknown>)
+              : callRecord.args && typeof callRecord.args === "object"
+                ? (callRecord.args as Record<string, unknown>)
+                : {};
+          const matching = toolResults.find(
+            (result) => result.toolCallId === call.toolCallId,
+          );
+          const output =
+            matching?.output && typeof matching.output === "object"
+              ? (matching.output as Record<string, unknown>)
+              : {};
+          const topicRaw = output.topicEntryId ?? rawArgs.topicEntryId;
+          const reasonRaw = output.reason ?? rawArgs.reason;
+          handoffToHumanCalls.push({
+            topicEntryId:
+              typeof topicRaw === "string" && topicRaw.trim()
+                ? topicRaw.trim()
+                : null,
+            reason:
+              typeof reasonRaw === "string" && reasonRaw.trim()
+                ? reasonRaw.trim()
+                : null,
+          });
+        }
+      }
+
+      console.info(
+        formatAgentStepFinishBlock(logScope, {
+          stepNumber: event.stepNumber,
+          stepAction,
+          finishReason: event.finishReason,
+          toolNames,
+          textPreview,
+          toolCallsCount: toolCalls.length,
+          toolResultsCount: toolResults.length,
+          toolCalls: toolCalls.map((call) => ({
+            toolName: call.toolName,
+            toolCallId: call.toolCallId,
+            args: call.input,
+          })),
+          toolResults: toolResults.map((result) => ({
+            toolName: result.toolName,
+            toolCallId: result.toolCallId,
+            output: result.output,
+          })),
+        }),
+      );
+    },
+  });
+
+  const primaryInputMessages = [...historyMessages, userMessageForModel];
+  let result: Awaited<ReturnType<typeof agent.generate>>;
+  try {
+    result = await agent.generate({
+      messages: primaryInputMessages,
+      ...(env.modelProvider === "groq" ? { maxOutputTokens: Number(process.env.GROQ_MAX_OUTPUT_TOKENS ?? 800) } : {}),
+    });
+  } catch (error) {
+    const messageText = error instanceof Error ? error.message : String(error);
+    if (isMissingToolResultError(messageText)) {
+      console.error(
+        `[${logScope}] Failed query: tool-call mismatch, retrying once without tools detail=${messageText}`,
+      );
+      const fallbackAgent = new ToolLoopAgent({
+        model: getChatLLM(),
+        instructions,
+        tools: {},
+        activeTools: [],
+        ...(env.modelProvider !== "groq" ? { output: Output.object({
+          schema: agentOutputSchema,
+          name: "agent_run_result",
+          description:
+            "Return the final agent run result without calling tools. Prefer empty messages, handoff_enabled false, and include reasoning_for_operators and sources.",
+        }) } : {}),
+        stopWhen: stepCountIs(20),
+      });
+      const cleanHistory = pruneOrphanedToolCalls(historyMessages);
+      result = await fallbackAgent.generate({
+        messages: [...cleanHistory, userMessageForModel],
+        ...(env.modelProvider === "groq" ? { maxOutputTokens: Number(process.env.GROQ_MAX_OUTPUT_TOKENS ?? 800) } : {}),
+      });
+    } else {
+      throw error;
+    }
+  }
+
+  const generated = extractGeneratedModelMessages(result);
+  const generatedToPersist = generated;
+
+  if (!isDryRun) {
+    const persisted = await insertAgentMessages(
+      generatedToPersist.map((message) => ({
+        workspaceId: input.workspaceId,
+        sessionId,
+        role: message.role,
+        content: asStorableAgentMessageContent(message.role, message.content),
+      })),
+    );
+
+    if (!persisted) {
+      return null;
+    }
+
+    await touchAgentSession(input.workspaceId, sessionId);
+  }
+
+  const structuredOutput = result.output;
+  const rawMessages = Array.isArray(structuredOutput?.messages)
+    ? structuredOutput.messages
+    : env.modelProvider === "groq" && typeof result.text === "string" && result.text.trim()
+      ? [{ text: result.text.trim(), assetFileName: "" }]
+      : [];
+  const handoffEnabled = Boolean(structuredOutput?.handoff_enabled);
+  const handoffCalled = handoffToHumanCalls.length > 0 || handoffEnabled;
+  const lastHandoff = handoffToHumanCalls[handoffToHumanCalls.length - 1];
+  const handoffTopicEntryId = lastHandoff?.topicEntryId ?? null;
+  const handoffReason = lastHandoff?.reason ?? null;
+  const reasoningForOperators = (
+    structuredOutput?.reasoning_for_operators ?? ""
+  ).trim();
+  const handoffTopicLabel = resolveHandoffTopicLabel(
+    handoffTopicEntryId,
+    sourceCatalog,
+    handoffCalled,
+  );
+  const replySources = resolveAgentReplySources({
+    modelSources: structuredOutput?.sources,
+    loadedSkillNames,
+    handoffTopicLabel,
+    catalog: sourceCatalog,
+  });
+
+  let outboundMessages = prepareOutboundMessages(rawMessages);
+  let outboundSent = 0;
+  let deliveries: Array<{
+    text: string;
+    assetFileName: string;
+    idMessage: string;
+  }> = [];
+  if (input.agentConfigId) {
+    const sent = await sendPreparedOutboundMessages({
+      workspaceId: input.workspaceId,
+      conversationId: sessionId,
+      agentConfigId: input.agentConfigId,
+      messages: rawMessages,
+      dryRun: isDryRun,
+      ...(agentRunId ? { agentRunId } : {}),
+    });
+    outboundMessages = sent.messages;
+    outboundSent = sent.sent;
+    deliveries = sent.deliveries;
+  }
+
+  const conversationLabels = summarizeApplyConversationLabelsCalls(
+    applyConversationLabelsCalls,
+  );
+
+  console.info(
+    formatAgentStructuredOutputBlock(logScope, {
+      sessionId,
+      dryRun: isDryRun,
+      structuredOutput,
+      outboundPrepared: outboundMessages,
+      outboundSent,
+      conversationLabels,
+    }),
+  );
+
+  if (!isDryRun) {
+    const logRows = [
+      {
+        workspaceId: input.workspaceId,
+        sessionId,
+        role: "assistant" as const,
+        content: {
+          type: AGENT_RUN_LOG_KIND_LLM_OUTPUT,
+          messages: structuredOutput?.messages ?? [],
+          reasoning_for_operators: reasoningForOperators,
+          sources: replySources,
+          handoff_enabled: handoffEnabled,
+          conversation_labels: conversationLabels,
+        },
+        providerOptions: {
+          source: AGENT_RUN_LOG_SOURCE,
+          kind: AGENT_RUN_LOG_KIND_LLM_OUTPUT,
+          ...(agentRunId ? { agent_run_id: agentRunId } : {}),
+        },
+      },
+      {
+        workspaceId: input.workspaceId,
+        sessionId,
+        role: "assistant" as const,
+        content: {
+          type: AGENT_RUN_LOG_KIND_WHATSAPP_SENT,
+          sent: outboundSent,
+          dryRun: isDryRun,
+          bubbles: deliveries.map((d) => ({
+            text: d.text,
+            assetFileName: d.assetFileName,
+            idMessage: d.idMessage,
+          })),
+        },
+        providerOptions: {
+          source: AGENT_RUN_LOG_SOURCE,
+          kind: AGENT_RUN_LOG_KIND_WHATSAPP_SENT,
+          ...(agentRunId ? { agent_run_id: agentRunId } : {}),
+        },
+      },
+    ];
+    const logsSaved = await insertAgentMessages(logRows);
+    if (!logsSaved) {
+      console.error(
+        `[${logScope}] Failed query: could not persist agent run logs conversationId=${sessionId}`,
+      );
+    }
+  }
+
+  if (!isDryRun && agentRunId && (reasoningForOperators || replySources.length > 0)) {
+    const merged = await mergeAiReasoningOntoAgentRunMessages({
+      workspaceId: input.workspaceId,
+      conversationId: sessionId,
+      agentRunId,
+      aiReasoning: reasoningForOperators,
+      aiSources: replySources,
+    });
+    if (!merged.ok) {
+      console.error(
+        `[${logScope}] Failed to persist operator reasoning metadata for conversationId=${sessionId}`,
+      );
+    }
+  }
+
+  return {
+    sessionId,
+    messages: outboundMessages,
+    handoff_enabled: handoffEnabled,
+    handoffCalled,
+    handoffTopicEntryId,
+    handoffReason,
+    reasoningForOperators,
+  };
+}

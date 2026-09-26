@@ -1,0 +1,191 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database/init-senqo-schema.sql:/docker-entrypoint-initdb.d/20-senqo-schema.sql:ro
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    # 1gb cap so a 17k-recipient campaign can sit comfortably in BullMQ's
+    # wait/active/completed structures without hitting OOM and refusing new
+    # writes. 256mb was the historical default; it broke on 2026-05-13 when
+    # a Karnataka campaign + RDB snapshot bloat exceeded the cap and Redis
+    # entered the noeviction-block state, cascading to login 500s and a
+    # stuck campaign.
+    command: redis-server --maxmemory 1gb --maxmemory-policy noeviction
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - backend
+
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    restart: always
+    command: >
+      sh -c "npx node-pg-migrate up --migrations-dir 'dist/db/migrations/*.js' --use-glob &&
+      node dist/db/seeds/001_admin-user.js && node dist/index.js"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379
+      PORT: 3001
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      TRACKING_DOMAIN: ${TRACKING_DOMAIN}
+      UPLOAD_DIR: /app/uploads
+      CORS_ORIGIN: ${TRACKING_DOMAIN}
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      AI_EMAIL_GENERATION_ENABLED: ${AI_EMAIL_GENERATION_ENABLED:-true}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
+      OPENAI_MAX_OUTPUT_TOKENS: ${OPENAI_MAX_OUTPUT_TOKENS:-4000}
+      OPENAI_TIMEOUT_MS: ${OPENAI_TIMEOUT_MS:-45000}
+      OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES:-2}
+      AI_RATE_LIMIT_REQUESTS: ${AI_RATE_LIMIT_REQUESTS:-10}
+      AI_RATE_LIMIT_WINDOW_MS: ${AI_RATE_LIMIT_WINDOW_MS:-60000}
+      SES_SNS_VERIFY_SIGNATURE: ${SES_SNS_VERIFY_SIGNATURE:-true}
+      SENQO_SSO_SHARED_SECRET: ${SENQO_SSO_SHARED_SECRET:-}
+      CAMPAIGN_APPROVAL_REQUIRED: ${CAMPAIGN_APPROVAL_REQUIRED:-false}
+      CAMPAIGN_ALLOW_SELF_APPROVAL: ${CAMPAIGN_ALLOW_SELF_APPROVAL:-false}
+    volumes:
+      - uploads:/app/uploads
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks:
+      - backend
+      - frontend
+
+  worker:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    restart: always
+    command: node dist/workers/index.js
+    depends_on:
+      server:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'node dist/workers' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET}
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      TRACKING_DOMAIN: ${TRACKING_DOMAIN}
+      UPLOAD_DIR: /app/uploads
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      SES_CONFIGURATION_SET: ${SES_CONFIGURATION_SET:-}
+      SES_EVENT_QUEUE_URL: ${SES_EVENT_QUEUE_URL:-}
+      SENQO_SSO_SHARED_SECRET: ${SENQO_SSO_SHARED_SECRET:-}
+      ADAPTIVE_RATE_WINDOW_SIZE: ${ADAPTIVE_RATE_WINDOW_SIZE:-100}
+      ADAPTIVE_RATE_MIN_PER_SECOND: ${ADAPTIVE_RATE_MIN_PER_SECOND:-1}
+      ADAPTIVE_RATE_INCREASE_FACTOR: ${ADAPTIVE_RATE_INCREASE_FACTOR:-1.10}
+      ADAPTIVE_RATE_DECREASE_FACTOR: ${ADAPTIVE_RATE_DECREASE_FACTOR:-0.50}
+      ADAPTIVE_THROTTLE_DECREASE_RATE: ${ADAPTIVE_THROTTLE_DECREASE_RATE:-0.01}
+      ADAPTIVE_DELAY_DECREASE_RATE: ${ADAPTIVE_DELAY_DECREASE_RATE:-0.05}
+      ADAPTIVE_FAILURE_DECREASE_RATE: ${ADAPTIVE_FAILURE_DECREASE_RATE:-0.02}
+      CAMPAIGN_BOUNCE_PAUSE_RATE: ${CAMPAIGN_BOUNCE_PAUSE_RATE:-0.05}
+      CAMPAIGN_COMPLAINT_PAUSE_RATE: ${CAMPAIGN_COMPLAINT_PAUSE_RATE:-0.001}
+      SENQO_AUTOMATION_WEBHOOK_URL: ${SENQO_AUTOMATION_WEBHOOK_URL:-}
+      SENQO_AUTOMATION_WEBHOOK_SECRET: ${SENQO_AUTOMATION_WEBHOOK_SECRET:-}
+      SENQO_OUTBOX_MAX_ATTEMPTS: ${SENQO_OUTBOX_MAX_ATTEMPTS:-8}
+      SENQO_DATABASE_URL: ${SENQO_DATABASE_URL:-}
+    volumes:
+      - uploads:/app/uploads
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks:
+      - backend
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api/v1
+    restart: always
+    networks:
+      - frontend
+
+  nginx:
+    image: nginx:alpine
+    restart: always
+    ports:
+      - "${HTTP_HOST_PORT:-8080}:80"
+      - "${HTTPS_HOST_PORT:-8443}:443"
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+      - ./certbot-etc:/etc/letsencrypt:ro
+      - ./certbot-var:/var/lib/letsencrypt
+      - ./certbot-webroot:/var/www/certbot
+    depends_on:
+      - server
+      - client
+    networks:
+      - frontend
+      - backend
+
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - ./certbot-etc:/etc/letsencrypt
+      - ./certbot-var:/var/lib/letsencrypt
+      - ./certbot-webroot:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do sleep 12h & wait $${!}; certbot renew --webroot -w /var/www/certbot; done'"
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:
+
+networks:
+  backend:
+  frontend:

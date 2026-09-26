@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Sendora SES configuration set and durable EventBridge-to-SQS feedback pipeline
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedPattern: '[a-zA-Z0-9-]+'
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Optional operations email for CloudWatch alarm notifications
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+  ConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: !Sub cadencerelay-${Environment}
+      ReputationOptions:
+        ReputationMetricsEnabled: true
+      SendingOptions:
+        SendingEnabled: true
+      SuppressionOptions:
+        SuppressedReasons: [BOUNCE, COMPLAINT]
+
+  ConfigurationSetEventDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    Properties:
+      ConfigurationSetName: !Ref ConfigurationSet
+      EventDestination:
+        Name: eventbridge
+        Enabled: true
+        MatchingEventTypes:
+          - send
+          - reject
+          - bounce
+          - complaint
+          - delivery
+          - open
+          - click
+          - renderingFailure
+          - deliveryDelay
+          - subscription
+        EventBridgeDestination:
+          EventBusArn: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default
+
+  EventDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub cadencerelay-${Environment}-ses-events-dlq
+      KmsMasterKeyId: alias/aws/sqs
+      MessageRetentionPeriod: 1209600
+
+  EventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub cadencerelay-${Environment}-ses-events
+      KmsMasterKeyId: alias/aws/sqs
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EventDeadLetterQueue.Arn
+        maxReceiveCount: 8
+
+  SesEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub cadencerelay-${Environment}-ses-events
+      Description: Routes SES configuration-set events to Sendora's durable queue
+      EventPattern:
+        source: [aws.ses]
+        detail-type:
+          - Email Sending Event
+          - Email Delivered
+          - Email Bounced
+          - Email Complaint Received
+          - Email Rejected
+          - Email Delivery Delayed
+          - Email Rendering Failed
+          - Email Opened
+          - Email Clicked
+          - Email Subscription Event
+      State: ENABLED
+      Targets:
+        - Id: CadenceRelayEventQueue
+          Arn: !GetAtt EventQueue.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt EventDeadLetterQueue.Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 86400
+            MaximumRetryAttempts: 20
+
+  EventQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EventQueue, !Ref EventDeadLetterQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EventBridgeSend
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: [!GetAtt EventQueue.Arn, !GetAtt EventDeadLetterQueue.Arn]
+            Condition:
+              ArnEquals: { aws:SourceArn: !GetAtt SesEventRule.Arn }
+
+  WorkerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Attach to the Sendora worker role; sending identities should be narrowed in production
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: SendAndInspectSES
+            Effect: Allow
+            Action:
+              - ses:SendEmail
+              - ses:GetAccount
+              - ses:GetEmailIdentity
+              - ses:GetSuppressedDestination
+              - ses:PutSuppressedDestination
+            Resource: '*'
+          - Sid: ConsumeEvents
+            Effect: Allow
+            Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+            Resource: !GetAtt EventQueue.Arn
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub cadencerelay-${Environment}-operations
+      KmsMasterKeyId: alias/aws/sns
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+      TopicArn: !Ref AlarmTopic
+
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub cadencerelay-${Environment}-ses-events-dlq-visible
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt EventDeadLetterQueue.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  QueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub cadencerelay-${Environment}-ses-event-age
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions: [{ Name: QueueName, Value: !GetAtt EventQueue.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 600
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+Outputs:
+  ConfigurationSetName: { Value: !Ref ConfigurationSet }
+  EventQueueUrl: { Value: !Ref EventQueue }
+  EventQueueArn: { Value: !GetAtt EventQueue.Arn }
+  EventDeadLetterQueueUrl: { Value: !Ref EventDeadLetterQueue }
+  WorkerPolicyArn: { Value: !Ref WorkerPolicy }
+  AlarmTopicArn: { Value: !Ref AlarmTopic }

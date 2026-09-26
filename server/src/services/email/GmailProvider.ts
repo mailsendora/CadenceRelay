@@ -1,0 +1,150 @@
+import nodemailer from 'nodemailer';
+import {
+  BaseEmailProvider, EmailOptions, SendResult,
+  PermanentBounceError, TemporaryBounceError, RateLimitError, AuthenticationError,
+  classifySmtpError,
+} from './EmailProvider';
+import { logger } from '../../utils/logger';
+
+interface GmailConfig {
+  host: string;
+  port: number;
+  user: string;          // SMTP auth identity (login username). For Brevo this is
+                         // a generated address like `9abc12@smtp-brevo.com`.
+  pass: string;
+  fromName?: string;
+  fromEmail?: string;    // Optional override for the visible From: address.
+                         // When omitted, defaults to `user` (the historical
+                         // Gmail/SMTP behaviour). Required for relays like
+                         // Brevo / Mailgun / Postmark where the SMTP login
+                         // username is not a deliverable mailbox.
+}
+
+export class GmailProvider extends BaseEmailProvider {
+  private transporter: nodemailer.Transporter;
+  private fromAddress: string;
+
+  constructor(config: GmailConfig) {
+    super();
+    // Separate auth identity from visible sender. `fromEmail` (trimmed) wins
+    // when present; otherwise fall back to `user` so existing single-field
+    // Gmail accounts keep working unchanged.
+    const senderEmail = config.fromEmail?.trim() || config.user;
+    this.fromAddress = config.fromName
+      ? `"${config.fromName}" <${senderEmail}>`
+      : senderEmail;
+    this.transporter = nodemailer.createTransport({
+      host: config.host,
+      port: config.port,
+      secure: false,
+      auth: {
+        user: config.user,
+        pass: config.pass,
+      },
+      pool: true,
+      maxConnections: 5,
+      maxMessages: 100,
+      rateDelta: 1000,
+      rateLimit: 5,
+    });
+  }
+
+  /** For tests/diagnostics only — exposes the computed RFC 5322 From: value. */
+  getFromAddress(): string {
+    return this.fromAddress;
+  }
+
+  /** Allow callers (and tests) to release the connection pool. */
+  async close(): Promise<void> {
+    this.transporter.close();
+  }
+
+  async send(options: EmailOptions): Promise<SendResult> {
+    const mailOptions: nodemailer.SendMailOptions = {
+      from: options.from || this.fromAddress,
+      to: options.to,
+      subject: options.subject,
+      html: options.html,
+      text: options.text,
+      replyTo: options.replyTo || this.fromAddress,
+      headers: options.headers || {},
+      attachments: options.attachments?.map((a) => ({
+        filename: a.filename,
+        content: a.content,
+        contentType: a.contentType,
+      })),
+    };
+
+    try {
+      const info = await this.transporter.sendMail(mailOptions);
+      logger.debug('Gmail: Email sent', { messageId: info.messageId, to: options.to });
+
+      // Check for rejected recipients (SMTP accepted but flagged)
+      if (info.rejected && info.rejected.length > 0) {
+        throw new PermanentBounceError(
+          `Recipient rejected by SMTP: ${info.rejected.join(', ')}`,
+          '550',
+          options.to
+        );
+      }
+
+      return {
+        messageId: info.messageId,
+        provider: 'gmail',
+      };
+    } catch (error: unknown) {
+      // If it's already one of our classified errors, re-throw
+      if (
+        error instanceof PermanentBounceError ||
+        error instanceof TemporaryBounceError ||
+        error instanceof RateLimitError ||
+        error instanceof AuthenticationError
+      ) {
+        throw error;
+      }
+
+      const err = error as { responseCode?: number; code?: string; message: string };
+
+      // Classify SMTP errors from Nodemailer
+      if (err.responseCode) {
+        throw classifySmtpError(err.responseCode, err.message, options.to);
+      }
+
+      // Connection errors (ECONNREFUSED, ETIMEDOUT, etc.)
+      if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT' || err.code === 'ESOCKET') {
+        throw new TemporaryBounceError(
+          `Gmail SMTP connection error: ${err.message}`,
+          err.code,
+          options.to
+        );
+      }
+
+      // Auth errors
+      if (err.code === 'EAUTH' || err.message?.includes('Invalid login')) {
+        throw new AuthenticationError(`Gmail authentication failed: ${err.message}`);
+      }
+
+      // Gmail rate limit patterns
+      if (err.message?.includes('Daily user sending limit exceeded') ||
+          err.message?.includes('too many') ||
+          err.message?.includes('rate limit')) {
+        throw new RateLimitError(`Gmail rate limit: ${err.message}`);
+      }
+
+      // Unknown error - rethrow as-is
+      logger.error('Gmail: Unclassified send error', { error: err.message, code: err.code, responseCode: err.responseCode });
+      throw error;
+    }
+  }
+
+  async verifyConnection(): Promise<boolean> {
+    try {
+      await this.transporter.verify();
+      logger.info('Gmail: SMTP connection verified');
+      return true;
+    } catch (error) {
+      logger.error('Gmail: SMTP connection failed', { error: (error as Error).message });
+      return false;
+    }
+  }
+}
